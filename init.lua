@@ -35,7 +35,6 @@ function m:jump(filter)
   m.logger.d('AppJump:Jump', newWindow)
   m.logger.d('Current', currentWindow)
   m.logger.d('Previous', m.previousWindow)
-  m.logger.d('newWindow ~= currentWindow', newWindow ~= currentWindow)
   m.logger.d('newWindow == currentWindow', newWindow == currentWindow)
   m.logger.d('----')
 
