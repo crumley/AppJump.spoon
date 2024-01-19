@@ -48,4 +48,32 @@ function m:jump(filter)
   newWindow:focus()
 end
 
+function m:summon(filter)
+  local newWindow = filter:getWindows(filter.sortByFocused)[1]
+  if newWindow == nil then
+    m.logger.d('Filter had no windows to jump to', filter)
+    return
+  end
+
+  local currentWindow = hs.window.focusedWindow()
+
+  m.logger.d('AppJump:summon', newWindow)
+  m.logger.d('Current', currentWindow)
+  m.logger.d('Previous', m.previousWindow)
+  m.logger.d('newWindow == currentWindow', newWindow == currentWindow)
+  m.logger.d('----')
+
+  if m.previousWindow ~= nil and newWindow == currentWindow then
+    m.previousWindow:focus()
+    m.previousWindow = currentWindow
+    return
+  end
+
+  local currentSpaceId = hs.spaces.focusedSpace()
+  hs.spaces.moveWindowToSpace(newWindow, currentSpaceId)
+
+  m.previousWindow = currentWindow
+  newWindow:focus()
+end
+
 return m
