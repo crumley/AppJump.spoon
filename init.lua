@@ -72,6 +72,8 @@ function m:summon(filter)
   local currentSpaceId = hs.spaces.focusedSpace()
   hs.spaces.moveWindowToSpace(newWindow, currentSpaceId)
 
+  -- TODO if already on this space put it back where it was
+
   m.previousWindow = currentWindow
   newWindow:focus()
 end
