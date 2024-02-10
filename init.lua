@@ -33,9 +33,13 @@ function m:init()
   m.windowFilter:setDefaultFilter()
   m.windowFilter:setSortOrder(filter.sortByFocusedLast)
 
-  for _, win in ipairs(m.windowFilter:getWindows()) do
-    table.insert(m.windows, win)
-  end
+  -- Load windows in background so hammerspoon startup doesn't block
+  hs.timer.doAfter(0,
+    function()
+      for _, win in ipairs(m.windowFilter:getWindows()) do
+        table.insert(m.windows, win)
+      end
+    end)
 
   local function addWindow(win, appName, event)
     table.insert(m.windows, 1, win)
