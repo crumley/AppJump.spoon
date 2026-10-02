@@ -11,6 +11,7 @@ local application = require("hs.application")
 local spaces = require("hs.spaces")
 local timer = require("hs.timer")
 local inspect = require("hs.inspect")
+local chooser = require("hs.chooser")
 
 local m = {}
 m.__index = m
@@ -29,6 +30,11 @@ m.originalWindowSpace = {}
 m.windows = {}
 
 -- Settings
+
+-- Optional: function(spaceId) -> string or nil, a label for the space a
+-- window is on, shown under each row of the window picker. AppJump knows
+-- nothing about space names; whoever loads it can wire one in.
+m.spaceLabel = nil
 
 function m:init()
   m.logger.d('init')
@@ -265,6 +271,119 @@ function m:summon(f)
   m.previousWindow = currentWindow
   newWindow:focus()
   traceAfterFocus('summon', newWindow)
+end
+
+-- Window picker ------------------------------------------------------------
+
+-- Whether a remembered window can be focused safely from any space: a window
+-- the window server has ordered in sits on a space; the tabs a tabbed app has
+-- switched away from (see exposedWindows) sit on none. A minimized window is
+-- on none either, but focusing it just restores it.
+local function focusable(win)
+  local ok, winSpaces = pcall(spaces.windowSpaces, win)
+  if ok and winSpaces and #winSpaces > 0 then
+    return true, winSpaces
+  end
+  return win:isMinimized(), {}
+end
+
+-- The frontmost app's windows on every space, one per window (for a tabbed
+-- app: its selected tab), most recently focused first, the window already
+-- focused last -- so Return goes to the window you were in before.
+--
+-- Windows on other spaces are known only once AppJump has seen them: macOS
+-- does not list another space's windows to accessibility, so after a
+-- Hammerspoon reload a window shows up here once its space has been visited.
+function m:frontmostAppWindows()
+  local app = application.frontmostApplication()
+  if app == nil then
+    return {}
+  end
+  local pid = app:pid()
+  local current = window.focusedWindow()
+  local found, seen = {}, {}
+
+  local function consider(win)
+    local id = win and win:id()
+    if id == nil or seen[id] then
+      return
+    end
+    local winApp = win:application()
+    if winApp == nil or winApp:pid() ~= pid or not win:isStandard() then
+      return
+    end
+    local ok, winSpaces = focusable(win)
+    if ok then
+      seen[id] = true
+      table.insert(found, { window = win, spaces = winSpaces })
+    end
+  end
+
+  for _, win in ipairs(m.windows) do
+    consider(win)
+  end
+  for _, win in ipairs(app:allWindows()) do
+    consider(win)
+  end
+
+  if current then
+    for i, entry in ipairs(found) do
+      if entry.window:id() == current:id() then
+        table.insert(found, table.remove(found, i))
+        break
+      end
+    end
+  end
+  return found
+end
+
+-- Show a chooser of the frontmost app's windows across spaces; picking one
+-- focuses it, switching to its space.
+function m:chooseWindow()
+  local entries = m:frontmostAppWindows()
+  if #entries == 0 then
+    m.logger.d('chooseWindow: no windows for the frontmost app')
+    return
+  end
+
+  local byId, choices = {}, {}
+  for _, entry in ipairs(entries) do
+    local win = entry.window
+    local label
+    if m.spaceLabel and entry.spaces[1] then
+      local ok, result = pcall(m.spaceLabel, entry.spaces[1])
+      label = ok and result or nil
+    end
+    if win:isMinimized() then
+      label = label and (label .. ' · minimized') or 'minimized'
+    end
+    byId[win:id()] = win
+    table.insert(choices, {
+      text = (win:title() ~= '' and win:title()) or win:application():name(),
+      subText = label,
+      id = win:id(),
+    })
+  end
+
+  m.picker = m.picker or chooser.new(function(choice)
+    if choice == nil then
+      return
+    end
+    local win = m.pickerWindows[choice.id]
+    -- Re-check: a tab switch since the list was built must not drag a window
+    -- across spaces.
+    if win and focusable(win) then
+      m.previousWindow = window.focusedWindow()
+      win:focus()
+      traceAfterFocus('choose', win)
+    else
+      m.logger.d('chooseWindow: window is no longer focusable', choice.id)
+    end
+  end)
+  m.pickerWindows = byId
+  m.picker:choices(choices)
+  m.picker:query(nil)
+  m.picker:show()
 end
 
 return m
