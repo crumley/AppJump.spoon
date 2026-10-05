@@ -349,18 +349,34 @@ function m:chooseWindow()
   local byId, choices = {}, {}
   for _, entry in ipairs(entries) do
     local win = entry.window
+    local appName = win:application():name()
+    local title = win:title()
+    -- Every row is the same app: drop its name from the end of the title
+    -- ("… - Google Chrome - Ryan" -> "…"), room the space label can use.
+    local cut = title:find(' - ' .. appName, 1, true)
+    if cut and cut > 1 then
+      title = title:sub(1, cut - 1)
+    end
+    if title == '' then
+      title = appName
+    end
     local label
     if m.spaceLabel and entry.spaces[1] then
       local ok, result = pcall(m.spaceLabel, entry.spaces[1])
       label = ok and result or nil
     end
-    if win:isMinimized() then
-      label = label and (label .. ' · minimized') or 'minimized'
+    -- The space is as much what tells windows apart as the title, so it leads
+    -- the same line (and is searched with it) rather than sitting in the small
+    -- print below. A window already named after its space (SpaceManager's
+    -- Chrome names) shows its title alone.
+    local text = title
+    if label and title:sub(1, #label) ~= label then
+      text = label .. ' · ' .. title
     end
     byId[win:id()] = win
     table.insert(choices, {
-      text = (win:title() ~= '' and win:title()) or win:application():name(),
-      subText = label,
+      text = text,
+      subText = win:isMinimized() and 'minimized' or nil,
       id = win:id(),
     })
   end
