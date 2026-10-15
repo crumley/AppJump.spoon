@@ -126,15 +126,31 @@ local function exposedWindows(f)
   return exposed, focused
 end
 
+-- Whether a remembered window can be focused safely from any space: a window
+-- the window server has ordered in sits on a space; the tabs a tabbed app has
+-- switched away from (see exposedWindows) sit on none. A minimized window is
+-- on none either, but focusing it just restores it.
+local function focusable(win)
+  local ok, winSpaces = pcall(spaces.windowSpaces, win)
+  if ok and winSpaces and #winSpaces > 0 then
+    return true, winSpaces
+  end
+  return win:isMinimized(), {}
+end
+
 -- Resolve the window a filter should jump to, in order of preference:
 --   1. the app's own focused window, the one it would bring forward itself
 --      (for a tabbed app: the tab you were last on);
---   2. the most recently focused exposed window we know about, per the cache;
+--   2. the most recently focused window we know about, per the cache, that is
+--      exposed or sits on a space (another space's windows are never exposed:
+--      macOS lists only the current space's windows to accessibility);
 --   3. any exposed window the filter allows.
--- Never a window the app does not currently expose (see exposedWindows).
+-- Never an ordered-out tab (see exposedWindows and focusable).
 --
 -- The cache in m.windows exists because f:getWindows() is slow without an
--- active subscription; it orders candidates but no longer decides them.
+-- active subscription. It is also the only way to know another space's
+-- windows, so after a Hammerspoon reload a window there can be jumped to once
+-- its space has been visited.
 function m:findWindow(f)
   local exposed, focused = exposedWindows(f)
 
@@ -147,6 +163,9 @@ function m:findWindow(f)
   for _, cached in ipairs(m.windows) do
     local id = cached:id()
     local w = id and exposed[id]
+    if w == nil and id and cached:isStandard() and focusable(cached) then
+      w = cached
+    end
     if w and f:isWindowAllowed(w) then
       return w, 'most recently focused'
     end
@@ -164,7 +183,8 @@ end
 -- A remembered window may have become an ordered-out tab since we saw it
 -- (the user switched tabs in that app without going through AppJump). Focus
 -- it and its tab group gets dragged to the active space, so fall back to the
--- app's focused window when the app no longer exposes it.
+-- app's focused window when the app no longer exposes it and it sits on no
+-- space (a window on another space is not exposed either, but is safe).
 local function stillExposed(win)
   if win == nil then
     return nil
@@ -177,6 +197,9 @@ local function stillExposed(win)
     if w == win then
       return win
     end
+  end
+  if focusable(win) then
+    return win
   end
   local fw = app:focusedWindow()
   if debugging() then
@@ -274,18 +297,6 @@ function m:summon(f)
 end
 
 -- Window picker ------------------------------------------------------------
-
--- Whether a remembered window can be focused safely from any space: a window
--- the window server has ordered in sits on a space; the tabs a tabbed app has
--- switched away from (see exposedWindows) sit on none. A minimized window is
--- on none either, but focusing it just restores it.
-local function focusable(win)
-  local ok, winSpaces = pcall(spaces.windowSpaces, win)
-  if ok and winSpaces and #winSpaces > 0 then
-    return true, winSpaces
-  end
-  return win:isMinimized(), {}
-end
 
 -- The frontmost app's windows on every space, one per window (for a tabbed
 -- app: its selected tab), most recently focused first, the window already
