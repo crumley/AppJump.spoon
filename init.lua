@@ -12,6 +12,7 @@ local spaces = require("hs.spaces")
 local timer = require("hs.timer")
 local inspect = require("hs.inspect")
 local chooser = require("hs.chooser")
+local eventtap = require("hs.eventtap")
 
 local m = {}
 m.__index = m
@@ -221,7 +222,168 @@ local function traceAfterFocus(verb, win)
   end)
 end
 
+-- A focus() return value is not an acknowledgement: it makes the window main
+-- and activates its app, while a cross-Space transition is still asynchronous.
+-- Repair only a verified, still-live target on its original desktop. In
+-- particular, never refocus a tab that became ordered-out while waiting.
+local function cancelFocus()
+  local request = m.focusRequest
+  m.focusRequest = nil
+  if request then
+    if request.timer then request.timer:stop() end
+    if request.input then request.input:stop() end
+  end
+end
+
+local function focusWithSettle(win, verb)
+  cancelFocus()
+  local safe, targetSpaces = focusable(win)
+  local id = win:id()
+  if not safe or not id then return end
+  if eventtap.isSecureInputEnabled() then
+    win:focus()
+    traceAfterFocus(verb, win)
+    return
+  end
+
+  local function clock() return timer.absoluteTime() / 1e9 end
+  local request = {}
+  m.focusRequest = request
+  local deadline = clock() + 1.5
+  local attempts, readySamples = 0, 0
+  local readySince, lastAttempt
+  local initialActive = spaces.activeSpaces() or {}
+  local displays = {}
+  for _, space in ipairs(targetSpaces) do
+    local display = spaces.spaceDisplay(space)
+    if display then displays[display] = true end
+  end
+  local arrived, crossSpace = false, true
+  for display in pairs(displays) do
+    if fnutils.contains(targetSpaces, initialActive[display]) then crossSpace = false end
+  end
+
+  local function onTop()
+    local screen = win:screen()
+    if not screen then return false end
+    local uuid = screen:getUUID()
+    local listed = window.list()
+    if type(listed) ~= 'table' then return nil end
+    local layers = {}
+    for _, entry in ipairs(listed) do
+      layers[entry.kCGWindowNumber] = entry.kCGWindowLayer
+    end
+    local targetLayer = layers[id]
+    if targetLayer == nil then return nil end
+    -- PiP can report AXStandardWindow yet live on a floating CG layer. Compare
+    -- only our target's layer (normally 0); raising cannot beat floating layers.
+    -- Unknown stacking data is not grounds for another raise.
+    for _, candidate in ipairs(window.orderedWindows()) do
+      local candidateScreen = candidate:screen()
+      if candidate:isStandard() and candidate:isVisible() and candidateScreen and
+          candidateScreen:getUUID() == uuid then
+        local layer = layers[candidate:id()]
+        if layer == nil then return nil end
+        if layer == targetLayer then return candidate:id() == id end
+      end
+    end
+    return nil
+  end
+
+  local types = eventtap.event.types
+  -- Do not intercept input. In particular keyUp/flagsChanged (releasing the
+  -- invoking Hyper chord) must not cancel the operation. Any *new* input wins.
+  request.input = eventtap.new({ types.keyDown, types.leftMouseDown,
+    types.rightMouseDown, types.otherMouseDown, types.scrollWheel, types.gesture }, function()
+    if m.focusRequest == request then cancelFocus() end
+    return false
+  end):start()
+  if not request.input:isEnabled() then
+    cancelFocus()
+    win:focus()
+    traceAfterFocus(verb, win)
+    return
+  end
+
+  local function poll()
+    if m.focusRequest ~= request then return end
+    request.timer = nil
+    local function finish(reason)
+      m.logger.d(verb .. ': focus settle ' .. reason)
+      cancelFocus()
+    end
+    if clock() >= deadline then return finish('timed out') end
+    if eventtap.isSecureInputEnabled() or not request.input:isEnabled() then
+      return finish('input monitoring unavailable')
+    end
+    if win:id() ~= id or win:application() == nil then return finish('target closed') end
+    local ok, nowSpaces = pcall(spaces.windowSpaces, win)
+    -- An empty list may be a native tab that was ordered out; isVisible()
+    -- alone cannot detect it. Even a minimized target gets no unsafe retry.
+    if not ok or not nowSpaces or #nowSpaces == 0 then return finish('target has no space') end
+    -- Minimized windows have no known destination before the initial focus.
+    -- Preserve their one-shot restore, rather than guessing where to retry.
+    if #targetSpaces == 0 then return finish('restore only') end
+    for _, space in ipairs(nowSpaces) do
+      if not fnutils.contains(targetSpaces, space) then return finish('target moved') end
+    end
+
+    local active = spaces.activeSpaces()
+    local onTarget = false
+    if active then
+      for display in pairs(displays) do
+        local current = active[display]
+        if fnutils.contains(targetSpaces, current) then
+          onTarget = true
+        elseif current and (arrived or current ~= initialActive[display]) then
+          return finish('user changed space')
+        end
+      end
+    end
+    arrived = arrived or onTarget
+    local exposed = false
+    if onTarget and win:isVisible() then
+      for _, candidate in ipairs(win:application():allWindows()) do
+        if candidate:id() == id then exposed = true; break end
+      end
+    end
+    local focused = window.focusedWindow()
+    readySamples = exposed and (readySamples + 1) or 0
+    if exposed then
+      readySince = readySince or clock()
+    else
+      readySince = nil
+    end
+    -- No public animation-completed signal exists. Allow a conservative .4s
+    -- grace after cross-Space readiness (upstream focus has a .3s Finder-only
+    -- workaround), and after a correction before declaring success. This is
+    -- observation, not a delayed unconditional focus. Spread failed repairs
+    -- out so they cannot all be spent during one transition.
+    local now = clock()
+    local grace = crossSpace and 0.4 or 0
+    if readySamples >= 2 and now - readySince >= grace then
+      local focusedTarget = focused and focused:id() == id
+      local top = focusedTarget and onTop()
+      if focusedTarget and top then
+        if not lastAttempt or now - lastAttempt >= 0.4 then return finish('succeeded') end
+      elseif (not focusedTarget or top == false) and
+          (not lastAttempt or now - lastAttempt >= 0.3) then
+        if attempts >= 3 then return finish('attempt limit') end
+        attempts, lastAttempt = attempts + 1, now
+        win:raise()
+        win:focus()
+      end
+    end
+    request.timer = timer.doAfter(0.05, poll)
+  end
+
+  win:focus() -- initiate normal app activation / Space switch exactly once
+  traceAfterFocus(verb, win)
+  request.timer = timer.doAfter(0.05, poll)
+end
+
 function m:jump(f)
+  cancelFocus()
   local newWindow, how = m:findWindow(f)
   if newWindow == nil then
     m.logger.d('Filter had no windows to jump to', f)
@@ -241,18 +403,17 @@ function m:jump(f)
     local target = stillExposed(m.previousWindow)
     m.previousWindow = currentWindow
     if target then
-      target:focus()
-      traceAfterFocus('jump (back)', target)
+      focusWithSettle(target, 'jump (back)')
     end
     return
   end
 
   m.previousWindow = currentWindow
-  newWindow:focus()
-  traceAfterFocus('jump', newWindow)
+  focusWithSettle(newWindow, 'jump')
 end
 
 function m:summon(f)
+  cancelFocus()
   local currentWindow = window.focusedWindow()
   local newWindow, how = m:findWindow(f)
 
@@ -351,6 +512,7 @@ end
 -- Show a chooser of the frontmost app's windows across spaces; picking one
 -- focuses it, switching to its space.
 function m:chooseWindow()
+  cancelFocus()
   local entries = m:frontmostAppWindows()
   if #entries == 0 then
     m.logger.d('chooseWindow: no windows for the frontmost app')
@@ -393,6 +555,7 @@ function m:chooseWindow()
   end
 
   m.picker = m.picker or chooser.new(function(choice)
+    cancelFocus()
     if choice == nil then
       return
     end
@@ -401,8 +564,7 @@ function m:chooseWindow()
     -- across spaces.
     if win and focusable(win) then
       m.previousWindow = window.focusedWindow()
-      win:focus()
-      traceAfterFocus('choose', win)
+      focusWithSettle(win, 'choose')
     else
       m.logger.d('chooseWindow: window is no longer focusable', choice.id)
     end
